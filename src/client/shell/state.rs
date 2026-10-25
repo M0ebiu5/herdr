@@ -902,6 +902,7 @@ pub(crate) struct ClientShellState {
     pub(super) mode: ClientShellMode,
     pub(super) navigate_workspace_id: Option<WorkspaceNavigationTarget>,
     pub(super) pending_workspace_highlight: Option<PendingWorkspaceHighlight>,
+    pub(super) recent: recent::RecentWorkspaces,
     pub(super) reveal_navigation_workspace: bool,
     pub(super) overlay: Option<ClientShellOverlay>,
     pub(super) previous_pane_id: Option<String>,
@@ -1076,6 +1077,7 @@ impl ClientShellState {
             mode: ClientShellMode::Terminal,
             navigate_workspace_id: None,
             pending_workspace_highlight: None,
+            recent: Default::default(),
             reveal_navigation_workspace: false,
             overlay,
             previous_pane_id: None,
@@ -1584,6 +1586,15 @@ impl ClientShellState {
                 }
                 Some(_) => {}
             }
+        }
+        if let Some(workspace_id) = snapshot.focused_workspace_id.clone() {
+            self.recent.visit(
+                std::time::Instant::now(),
+                recent::RecentWorkspace {
+                    endpoint_id: self.active_endpoint_id.clone(),
+                    workspace_id,
+                },
+            );
         }
         self.snapshot = Some(snapshot);
         self.reconcile_pending_workspace_highlight();
