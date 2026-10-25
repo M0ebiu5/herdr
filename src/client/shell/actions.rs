@@ -44,7 +44,7 @@ impl ClientShellState {
                     return;
                 }
                 if action == crate::input::KeybindAction::RecentWorkspace {
-                    self.switch_recent_workspace(outcome);
+                    self.open_recent_switcher(outcome);
                     return;
                 }
                 if action == crate::input::KeybindAction::OpenNavigator {

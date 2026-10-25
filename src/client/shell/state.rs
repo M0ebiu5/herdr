@@ -285,6 +285,7 @@ pub(super) enum ClientShellOverlayKind {
     ConfirmClose,
     Help,
     Navigator,
+    RecentSwitcher,
     WorktreeCreate,
     WorktreeOpen,
     WorktreeRemove,
@@ -588,6 +589,7 @@ pub(super) enum ClientShellOverlay {
     ConfirmClose(ClientConfirmCloseOverlay),
     Help(ClientHelpOverlay),
     Navigator(ClientNavigatorOverlay),
+    RecentSwitcher(recent::RecentSwitcher),
     WorktreeCreate(ClientWorktreeCreateOverlay),
     WorktreeOpen(ClientWorktreeOpenOverlay),
     WorktreeRemove(ClientWorktreeRemoveOverlay),
@@ -606,6 +608,7 @@ impl ClientShellOverlay {
             Self::ConfirmClose(_) => ClientShellOverlayKind::ConfirmClose,
             Self::Help(_) => ClientShellOverlayKind::Help,
             Self::Navigator(_) => ClientShellOverlayKind::Navigator,
+            Self::RecentSwitcher(_) => ClientShellOverlayKind::RecentSwitcher,
             Self::WorktreeCreate(_) => ClientShellOverlayKind::WorktreeCreate,
             Self::WorktreeOpen(_) => ClientShellOverlayKind::WorktreeOpen,
             Self::WorktreeRemove(_) => ClientShellOverlayKind::WorktreeRemove,
@@ -1588,13 +1591,10 @@ impl ClientShellState {
             }
         }
         if let Some(workspace_id) = snapshot.focused_workspace_id.clone() {
-            self.recent.visit(
-                std::time::Instant::now(),
-                recent::RecentWorkspace {
-                    endpoint_id: self.active_endpoint_id.clone(),
-                    workspace_id,
-                },
-            );
+            self.recent.visit(recent::RecentWorkspace {
+                endpoint_id: self.active_endpoint_id.clone(),
+                workspace_id,
+            });
         }
         self.snapshot = Some(snapshot);
         self.reconcile_pending_workspace_highlight();
@@ -1894,6 +1894,7 @@ impl ClientShellState {
         self.selection_autoscroll_deadline
             .into_iter()
             .chain(self.selection_repaint_deadline)
+            .chain(self.recent_switcher_deadline())
             .min()
             .map(|deadline| deadline.saturating_duration_since(now).min(default))
             .unwrap_or(default)

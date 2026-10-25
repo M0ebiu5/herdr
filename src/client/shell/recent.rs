@@ -1,19 +1,23 @@
-//! Most recently used workspaces across every machine, for the `recent_workspace`
-//! key: one press goes to the previous workspace, further presses in quick
-//! succession step back through the history, like cycling windows with Alt+Tab.
-//! Repeat presses are told apart by a short window since the last press, because a
-//! terminal reports no key release.
+//! Most recently used workspaces across every machine, and the switcher the
+//! `recent_workspace` key opens over them: a list in recent order with the
+//! target highlighted. Further presses move the highlight and letting go of the
+//! modifier switches, like Alt+Tab for windows. A terminal that cannot report the
+//! release switches after a pause in the presses instead.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
 use serde::{Deserialize, Serialize};
 
 use super::*;
 
-/// How long after a press the next one still continues the same cycle.
-pub(super) const CYCLE_WINDOW: Duration = Duration::from_millis(700);
 const HISTORY_LIMIT: usize = 64;
+/// Without key release reports, the switcher switches this long after the last press.
+const IDLE_COMMIT: Duration = Duration::from_millis(900);
+/// With them, a switcher that never hears the release (the key was let go while
+/// another window had focus, say) closes without switching after this long.
+const ABANDON_AFTER: Duration = Duration::from_secs(15);
 
 /// A workspace on one machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,33 +26,10 @@ pub(super) struct RecentWorkspace {
     pub(super) workspace_id: String,
 }
 
-/// A run of presses. The history is frozen while it runs, so each press lands
-/// one step further back, and only the workspace it ends on becomes the most
-/// recent: the ones passed on the way are not visits.
-struct Cycle {
-    list: Vec<RecentWorkspace>,
-    index: usize,
-    last_press: Instant,
-    /// Every workspace the cycle has jumped to. A machine can confirm a jump
-    /// only after the next press, so their visits are not the user's own.
-    jumped_to: Vec<RecentWorkspace>,
-}
-
-impl Cycle {
-    fn landed(&self) -> &RecentWorkspace {
-        &self.list[self.index]
-    }
-
-    fn expired(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_press) > CYCLE_WINDOW
-    }
-}
-
 #[derive(Default)]
 pub(super) struct RecentWorkspaces {
     /// Most recently used first.
     history: Vec<RecentWorkspace>,
-    cycle: Option<Cycle>,
     /// Where the history is kept between runs. Unset in tests, which must never
     /// write to the user's state directory.
     store: Option<PathBuf>,
@@ -96,7 +77,6 @@ impl RecentWorkspaces {
         history.truncate(HISTORY_LIMIT);
         Self {
             history,
-            cycle: None,
             store: Some(path),
         }
     }
@@ -126,7 +106,8 @@ impl RecentWorkspaces {
         }
     }
 
-    fn promote(&mut self, workspace: RecentWorkspace) {
+    /// The focused workspace on the active machine changed.
+    pub(super) fn visit(&mut self, workspace: RecentWorkspace) {
         if self.history.first() == Some(&workspace) {
             return;
         }
@@ -136,70 +117,111 @@ impl RecentWorkspaces {
         self.save();
     }
 
-    /// End a finished cycle: the workspace it landed on is now the most recent.
-    fn settle(&mut self, now: Instant) {
-        if self.cycle.as_ref().is_some_and(|cycle| cycle.expired(now)) {
-            self.end_cycle();
-        }
-    }
-
-    fn end_cycle(&mut self) {
-        if let Some(cycle) = self.cycle.take() {
-            let landed = cycle.landed().clone();
-            self.promote(landed);
-        }
-    }
-
-    /// The focused workspace on the active machine changed.
-    pub(super) fn visit(&mut self, now: Instant, workspace: RecentWorkspace) {
-        self.settle(now);
-        if let Some(cycle) = &self.cycle {
-            if cycle.jumped_to.contains(&workspace) {
-                // This is a jump a press made, not a visit of its own.
-                return;
-            }
-            self.end_cycle();
-        }
-        self.promote(workspace);
-    }
-
-    /// A press: the workspace to go to, if there is another one. `current` is the
-    /// workspace shown now and `existing` every workspace that is still there on
-    /// a machine that is reachable.
-    pub(super) fn press(
-        &mut self,
-        now: Instant,
+    /// The workspace shown, then the ones used before it, then any others in
+    /// sidebar order, so there is somewhere to go even with no history yet.
+    /// `existing` is every workspace that is still there on a reachable machine.
+    fn candidates(
+        &self,
         current: Option<RecentWorkspace>,
         existing: &[RecentWorkspace],
-    ) -> Option<RecentWorkspace> {
-        self.settle(now);
-        if let Some(cycle) = self.cycle.as_mut() {
-            cycle.index = (cycle.index + 1) % cycle.list.len();
-            cycle.last_press = now;
-            let landed = cycle.landed().clone();
-            cycle.jumped_to.push(landed.clone());
-            return Some(landed);
-        }
-        // The workspace shown, then the ones used before it, then any others in
-        // sidebar order, so a press has somewhere to go even with no history yet.
+    ) -> Vec<RecentWorkspace> {
         let mut list: Vec<RecentWorkspace> = current.iter().cloned().collect();
         for entry in self.history.iter().chain(existing) {
             if existing.contains(entry) && !list.contains(entry) {
                 list.push(entry.clone());
             }
         }
-        if list.len() < 2 {
-            return None;
-        }
-        let target = list[1].clone();
-        self.cycle = Some(Cycle {
-            list,
-            index: 1,
-            last_press: now,
-            jumped_to: vec![target.clone()],
-        });
-        Some(target)
+        list
     }
+}
+
+/// What a timer tick should do with the open switcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SwitcherTimeout {
+    Wait,
+    Commit,
+    Abandon,
+}
+
+/// The open switcher: the workspaces in recent order, frozen when it opened, with
+/// the first one the workspace shown now.
+#[derive(Debug)]
+pub(super) struct RecentSwitcher {
+    pub(super) list: Vec<RecentWorkspace>,
+    pub(super) selected: usize,
+    last_input: Instant,
+    /// The terminal reports key releases, so letting go of the modifier ends it.
+    commit_on_release: bool,
+}
+
+impl RecentSwitcher {
+    /// None when there is no other workspace to go to.
+    fn open(list: Vec<RecentWorkspace>, now: Instant, commit_on_release: bool) -> Option<Self> {
+        (list.len() >= 2).then_some(Self {
+            list,
+            selected: 1,
+            last_input: now,
+            commit_on_release,
+        })
+    }
+
+    fn step(&mut self, now: Instant, backwards: bool) {
+        let len = self.list.len();
+        self.selected = if backwards {
+            (self.selected + len - 1) % len
+        } else {
+            (self.selected + 1) % len
+        };
+        self.last_input = now;
+    }
+
+    fn target(&self) -> &RecentWorkspace {
+        &self.list[self.selected]
+    }
+
+    fn timeout(&self, now: Instant) -> SwitcherTimeout {
+        let idle = now.saturating_duration_since(self.last_input);
+        if self.commit_on_release {
+            if idle >= ABANDON_AFTER {
+                SwitcherTimeout::Abandon
+            } else {
+                SwitcherTimeout::Wait
+            }
+        } else if idle >= IDLE_COMMIT {
+            SwitcherTimeout::Commit
+        } else {
+            SwitcherTimeout::Wait
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        self.last_input
+            + if self.commit_on_release {
+                ABANDON_AFTER
+            } else {
+                IDLE_COMMIT
+            }
+    }
+}
+
+/// Letting go of one of these ends the switcher; Shift is held to go backwards, so
+/// it does not.
+fn is_switching_modifier(code: &KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Modifier(
+            ModifierKeyCode::LeftControl
+                | ModifierKeyCode::RightControl
+                | ModifierKeyCode::LeftAlt
+                | ModifierKeyCode::RightAlt
+                | ModifierKeyCode::LeftSuper
+                | ModifierKeyCode::RightSuper
+                | ModifierKeyCode::LeftMeta
+                | ModifierKeyCode::RightMeta
+                | ModifierKeyCode::LeftHyper
+                | ModifierKeyCode::RightHyper
+        )
+    )
 }
 
 impl ClientShellState {
@@ -233,19 +255,145 @@ impl ClientShellState {
         self.recent = RecentWorkspaces::persisted(history_path());
     }
 
-    /// The `recent_workspace` key.
-    pub(super) fn switch_recent_workspace(&mut self, outcome: &mut ClientShellInput) {
-        let existing = self.existing_workspaces();
-        let current = self.current_recent_workspace();
-        let Some(target) = self.recent.press(Instant::now(), current, &existing) else {
+    /// The `recent_workspace` key: open the switcher on the previous workspace.
+    pub(super) fn open_recent_switcher(&mut self, outcome: &mut ClientShellInput) {
+        let list = self
+            .recent
+            .candidates(self.current_recent_workspace(), &self.existing_workspaces());
+        let Some(switcher) =
+            RecentSwitcher::open(list, Instant::now(), self.host_reports_key_releases)
+        else {
             return;
         };
+        self.overlay = Some(ClientShellOverlay::RecentSwitcher(switcher));
+        outcome.repaint = true;
+    }
+
+    pub(super) fn recent_switcher_open(&self) -> bool {
+        matches!(self.overlay, Some(ClientShellOverlay::RecentSwitcher(_)))
+    }
+
+    /// Whether `key` is the `recent_workspace` key again, and if so whether it is
+    /// held with Shift, which goes backwards.
+    fn recent_binding_press(&self, key: &crate::input::TerminalKey) -> Option<bool> {
+        let is_binding = |key: &crate::input::TerminalKey| {
+            matches!(
+                crate::input::resolve_direct_binding(&self.config.keybinds.keybinds, key),
+                Some(crate::input::KeybindMatch::Action(
+                    crate::input::KeybindAction::RecentWorkspace
+                ))
+            )
+        };
+        if is_binding(key) {
+            return Some(false);
+        }
+        let without_shift = key.modifiers.difference(KeyModifiers::SHIFT);
+        let unshifted = if key.code == KeyCode::BackTab {
+            crate::input::TerminalKey::new(KeyCode::Tab, without_shift)
+        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+            key.clone().with_modifiers(without_shift)
+        } else {
+            return None;
+        };
+        is_binding(&unshifted).then_some(true)
+    }
+
+    /// A key pressed while the switcher is open.
+    pub(super) fn route_recent_switcher_key(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        outcome: &mut ClientShellInput,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                outcome.repaint = true;
+                return;
+            }
+            KeyCode::Enter => {
+                self.commit_recent_switcher(outcome);
+                return;
+            }
+            _ => {}
+        }
+        let backwards = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(true),
+            KeyCode::Down | KeyCode::Char('j') => Some(false),
+            _ => self.recent_binding_press(key),
+        };
+        let Some(backwards) = backwards else {
+            return;
+        };
+        if let Some(ClientShellOverlay::RecentSwitcher(switcher)) = self.overlay.as_mut() {
+            switcher.step(Instant::now(), backwards);
+            outcome.repaint = true;
+        }
+    }
+
+    /// A key was let go. True when that ended the switcher, which then switched.
+    pub(super) fn recent_switcher_key_released(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        outcome: &mut ClientShellInput,
+    ) -> bool {
+        let Some(ClientShellOverlay::RecentSwitcher(switcher)) = self.overlay.as_ref() else {
+            return false;
+        };
+        if !switcher.commit_on_release || !is_switching_modifier(&key.code) {
+            return false;
+        }
+        self.commit_recent_switcher(outcome);
+        true
+    }
+
+    /// Close the switcher and go to the highlighted workspace.
+    pub(super) fn commit_recent_switcher(&mut self, outcome: &mut ClientShellInput) {
+        let Some(ClientShellOverlay::RecentSwitcher(switcher)) = self.overlay.take() else {
+            return;
+        };
+        outcome.repaint = true;
+        let target = switcher.target().clone();
+        if switcher.selected == 0 || !self.existing_workspaces().contains(&target) {
+            return;
+        }
         self.focus_or_activate(
             target.endpoint_id,
             ClientEndpointFocusTarget::Workspace(target.workspace_id),
             outcome,
         );
-        outcome.repaint = true;
+    }
+
+    /// Close the switcher without switching.
+    pub(super) fn cancel_recent_switcher(&mut self) -> bool {
+        if !self.recent_switcher_open() {
+            return false;
+        }
+        self.overlay = None;
+        true
+    }
+
+    /// A timer tick: switch after a pause in the presses when the terminal cannot
+    /// report the release, and give up on a switcher nothing has ended.
+    pub(crate) fn tick_recent_switcher(&mut self, now: Instant, outcome: &mut ClientShellInput) {
+        let Some(ClientShellOverlay::RecentSwitcher(switcher)) = self.overlay.as_ref() else {
+            return;
+        };
+        match switcher.timeout(now) {
+            SwitcherTimeout::Wait => {}
+            SwitcherTimeout::Commit => self.commit_recent_switcher(outcome),
+            SwitcherTimeout::Abandon => {
+                self.overlay = None;
+                outcome.repaint = true;
+            }
+        }
+    }
+
+    /// When the switcher next needs a timer tick.
+    pub(crate) fn recent_switcher_deadline(&self) -> Option<Instant> {
+        match self.overlay.as_ref() {
+            Some(ClientShellOverlay::RecentSwitcher(switcher)) => Some(switcher.deadline()),
+            _ => None,
+        }
     }
 }
 
@@ -277,119 +425,108 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn a_press_goes_to_the_previous_workspace_and_back() {
-        let base = Instant::now();
+    fn history(order: &[RecentWorkspace]) -> RecentWorkspaces {
         let mut recent = RecentWorkspaces::default();
-        recent.visit(base, workspace("", "w1"));
-        recent.visit(at(base, 10), workspace("", "w2"));
-
-        let target = recent.press(at(base, 20_000), Some(workspace("", "w2")), &all());
-        assert_eq!(target, Some(workspace("", "w1")));
-        // The jump lands and is recorded; a later press returns to where it came from.
-        recent.visit(at(base, 20_050), workspace("", "w1"));
-        let back = recent.press(at(base, 40_000), Some(workspace("", "w1")), &all());
-        assert_eq!(back, Some(workspace("", "w2")));
-    }
-
-    #[test]
-    fn presses_in_quick_succession_step_further_back() {
-        let base = Instant::now();
-        let mut recent = RecentWorkspaces::default();
-        for (i, ws) in [
-            workspace("", "w1"),
-            workspace("", "w2"),
-            workspace("big", "w3"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            recent.visit(at(base, i as u64), ws);
+        for entry in order.iter().rev() {
+            recent.visit(entry.clone());
         }
-        let now = at(base, 10_000);
-        let first = recent.press(now, Some(workspace("big", "w3")), &all());
-        assert_eq!(first, Some(workspace("", "w2")));
-        let second = recent.press(at(now, 300), Some(workspace("", "w2")), &all());
-        assert_eq!(second, Some(workspace("", "w1")));
-        // Past the end of the history it wraps to where the cycle started.
-        let third = recent.press(at(now, 600), Some(workspace("", "w1")), &all());
-        assert_eq!(third, Some(workspace("big", "w3")));
+        recent
     }
 
     #[test]
-    fn only_the_workspace_a_cycle_ends_on_becomes_the_most_recent() {
-        let base = Instant::now();
-        let mut recent = RecentWorkspaces::default();
-        for (i, ws) in [
-            workspace("", "w1"),
-            workspace("", "w2"),
-            workspace("big", "w3"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            recent.visit(at(base, i as u64), ws);
-        }
-        let now = at(base, 10_000);
-        recent.press(now, Some(workspace("big", "w3")), &all()); // w2
-        recent.press(at(now, 300), Some(workspace("", "w2")), &all()); // w1
-        recent.visit(at(now, 350), workspace("", "w2"));
-        recent.visit(at(now, 400), workspace("", "w1"));
-        // After the cycle, w2 was only passed through: the previous one is w3.
-        let later = at(now, 30_000);
-        let target = recent.press(later, Some(workspace("", "w1")), &all());
-        assert_eq!(target, Some(workspace("big", "w3")));
-    }
-
-    #[test]
-    fn workspaces_that_are_gone_are_skipped() {
-        let base = Instant::now();
-        let mut recent = RecentWorkspaces::default();
-        recent.visit(base, workspace("", "w1"));
-        recent.visit(at(base, 1), workspace("", "gone"));
-        recent.visit(at(base, 2), workspace("", "w2"));
-        let target = recent.press(at(base, 9_000), Some(workspace("", "w2")), &all());
-        assert_eq!(target, Some(workspace("", "w1")));
-    }
-
-    #[test]
-    fn a_lone_workspace_has_nowhere_to_go() {
-        let base = Instant::now();
-        let mut recent = RecentWorkspaces::default();
-        recent.visit(base, workspace("", "w1"));
-        let only = [workspace("", "w1")];
+    fn candidates_are_the_current_workspace_then_the_recent_ones() {
+        let recent = history(&[workspace("big", "w3"), workspace("", "w1")]);
+        let list = recent.candidates(Some(workspace("big", "w3")), &all());
+        // w3 is shown, w1 was used before it, w2 was never visited.
         assert_eq!(
-            recent.press(at(base, 5_000), Some(workspace("", "w1")), &only),
-            None
+            list,
+            [
+                workspace("big", "w3"),
+                workspace("", "w1"),
+                workspace("", "w2")
+            ]
         );
     }
 
     #[test]
-    fn moving_elsewhere_during_a_cycle_ends_it() {
-        let base = Instant::now();
-        let mut recent = RecentWorkspaces::default();
-        recent.visit(base, workspace("", "w1"));
-        recent.visit(at(base, 1), workspace("", "w2"));
-        let now = at(base, 5_000);
-        recent.press(now, Some(workspace("", "w2")), &all()); // lands on w1
-                                                              // The user picks another workspace by hand before settling.
-        recent.visit(at(now, 200), workspace("big", "w3"));
-        let target = recent.press(at(now, 20_000), Some(workspace("big", "w3")), &all());
-        // w1 was landed on, so it is the previous one, not w2.
-        assert_eq!(target, Some(workspace("", "w1")));
+    fn workspaces_that_are_gone_are_left_out() {
+        let recent = history(&[
+            workspace("", "w2"),
+            workspace("", "gone"),
+            workspace("", "w1"),
+        ]);
+        let list = recent.candidates(Some(workspace("", "w2")), &all());
+        assert_eq!(list[..2], [workspace("", "w2"), workspace("", "w1")]);
+        assert!(!list.contains(&workspace("", "gone")));
     }
 
     #[test]
-    fn a_fresh_client_still_has_somewhere_to_go() {
+    fn a_fresh_client_falls_back_to_sidebar_order() {
+        let recent = RecentWorkspaces::default();
+        let list = recent.candidates(Some(workspace("", "w2")), &all());
+        assert_eq!(
+            list,
+            [
+                workspace("", "w2"),
+                workspace("", "w1"),
+                workspace("big", "w3")
+            ]
+        );
+    }
+
+    #[test]
+    fn the_switcher_opens_on_the_previous_workspace_and_wraps_both_ways() {
         let base = Instant::now();
-        let mut recent = RecentWorkspaces::default();
-        recent.visit(base, workspace("", "w2"));
-        // Nothing but the workspace shown is known, so go by sidebar order.
-        let now = at(base, 5_000);
-        let first = recent.press(now, Some(workspace("", "w2")), &all());
-        assert_eq!(first, Some(workspace("", "w1")));
-        let second = recent.press(at(now, 300), Some(workspace("", "w1")), &all());
-        assert_eq!(second, Some(workspace("big", "w3")));
+        let mut switcher = RecentSwitcher::open(all(), base, true).unwrap();
+        assert_eq!(switcher.selected, 1);
+        assert_eq!(switcher.target(), &workspace("", "w2"));
+        switcher.step(at(base, 100), false);
+        assert_eq!(switcher.target(), &workspace("big", "w3"));
+        // Past the end it comes back to the workspace shown.
+        switcher.step(at(base, 200), false);
+        assert_eq!(switcher.selected, 0);
+        switcher.step(at(base, 300), true);
+        assert_eq!(switcher.target(), &workspace("big", "w3"));
+    }
+
+    #[test]
+    fn a_lone_workspace_has_nowhere_to_go() {
+        assert!(RecentSwitcher::open(vec![workspace("", "w1")], Instant::now(), true).is_none());
+    }
+
+    #[test]
+    fn without_release_reports_it_switches_after_a_pause_in_the_presses() {
+        let base = Instant::now();
+        let mut switcher = RecentSwitcher::open(all(), base, false).unwrap();
+        assert_eq!(switcher.timeout(at(base, 500)), SwitcherTimeout::Wait);
+        // A press starts the pause again.
+        switcher.step(at(base, 800), false);
+        assert_eq!(switcher.timeout(at(base, 1_500)), SwitcherTimeout::Wait);
+        assert_eq!(switcher.timeout(at(base, 1_800)), SwitcherTimeout::Commit);
+        assert_eq!(switcher.deadline(), at(base, 800) + IDLE_COMMIT);
+    }
+
+    #[test]
+    fn with_release_reports_only_a_stuck_switcher_gives_up() {
+        let base = Instant::now();
+        let switcher = RecentSwitcher::open(all(), base, true).unwrap();
+        // Holding the modifier to read the list is fine for a long while.
+        assert_eq!(switcher.timeout(at(base, 10_000)), SwitcherTimeout::Wait);
+        assert_eq!(switcher.timeout(at(base, 16_000)), SwitcherTimeout::Abandon);
+    }
+
+    #[test]
+    fn only_letting_go_of_a_switching_modifier_counts() {
+        assert!(is_switching_modifier(&KeyCode::Modifier(
+            ModifierKeyCode::LeftControl
+        )));
+        assert!(is_switching_modifier(&KeyCode::Modifier(
+            ModifierKeyCode::RightAlt
+        )));
+        assert!(!is_switching_modifier(&KeyCode::Modifier(
+            ModifierKeyCode::LeftShift
+        )));
+        assert!(!is_switching_modifier(&KeyCode::Tab));
     }
 
     #[test]
@@ -398,22 +535,19 @@ mod tests {
         let path = dir.join("recent-workspaces.json");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let base = Instant::now();
         let mut first_run = RecentWorkspaces::persisted(path.clone());
-        first_run.visit(base, workspace("", "w1"));
-        first_run.visit(at(base, 1), workspace("big", "w3"));
-        first_run.visit(at(base, 2), workspace("", "w2"));
+        first_run.visit(workspace("", "w1"));
+        first_run.visit(workspace("big", "w3"));
+        first_run.visit(workspace("", "w2"));
 
-        let mut second_run = RecentWorkspaces::persisted(path.clone());
-        let target = second_run.press(at(base, 9_000), Some(workspace("", "w2")), &all());
-        assert_eq!(target, Some(workspace("big", "w3")));
+        let second_run = RecentWorkspaces::persisted(path.clone());
+        let list = second_run.candidates(Some(workspace("", "w2")), &all());
+        assert_eq!(list[1], workspace("big", "w3"));
 
         std::fs::write(&path, b"not json").expect("write garbage");
-        let mut broken = RecentWorkspaces::persisted(path);
-        assert_eq!(
-            broken.press(at(base, 9_000), Some(workspace("", "w2")), &all()),
-            Some(workspace("", "w1"))
-        );
+        let broken = RecentWorkspaces::persisted(path);
+        let list = broken.candidates(Some(workspace("", "w2")), &all());
+        assert_eq!(list[1], workspace("", "w1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

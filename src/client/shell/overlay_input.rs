@@ -477,6 +477,11 @@ impl ClientShellState {
     ) {
         use crossterm::event::KeyModifiers;
 
+        if self.recent_switcher_open() {
+            self.route_recent_switcher_key(key, outcome);
+            return;
+        }
+
         if matches!(self.overlay, Some(ClientShellOverlay::Onboarding)) {
             if matches!(
                 key.code,
