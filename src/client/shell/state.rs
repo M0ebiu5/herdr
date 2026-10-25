@@ -285,6 +285,7 @@ pub(super) enum ClientShellOverlayKind {
     ConfirmClose,
     Help,
     Navigator,
+    RecentSwitcher,
     WorktreeCreate,
     WorktreeOpen,
     WorktreeRemove,
@@ -588,6 +589,7 @@ pub(super) enum ClientShellOverlay {
     ConfirmClose(ClientConfirmCloseOverlay),
     Help(ClientHelpOverlay),
     Navigator(ClientNavigatorOverlay),
+    RecentSwitcher(recent::RecentSwitcher),
     WorktreeCreate(ClientWorktreeCreateOverlay),
     WorktreeOpen(ClientWorktreeOpenOverlay),
     WorktreeRemove(ClientWorktreeRemoveOverlay),
@@ -606,6 +608,7 @@ impl ClientShellOverlay {
             Self::ConfirmClose(_) => ClientShellOverlayKind::ConfirmClose,
             Self::Help(_) => ClientShellOverlayKind::Help,
             Self::Navigator(_) => ClientShellOverlayKind::Navigator,
+            Self::RecentSwitcher(_) => ClientShellOverlayKind::RecentSwitcher,
             Self::WorktreeCreate(_) => ClientShellOverlayKind::WorktreeCreate,
             Self::WorktreeOpen(_) => ClientShellOverlayKind::WorktreeOpen,
             Self::WorktreeRemove(_) => ClientShellOverlayKind::WorktreeRemove,
@@ -902,6 +905,7 @@ pub(crate) struct ClientShellState {
     pub(super) mode: ClientShellMode,
     pub(super) navigate_workspace_id: Option<WorkspaceNavigationTarget>,
     pub(super) pending_workspace_highlight: Option<PendingWorkspaceHighlight>,
+    pub(super) recent: recent::RecentWorkspaces,
     pub(super) reveal_navigation_workspace: bool,
     pub(super) overlay: Option<ClientShellOverlay>,
     pub(super) previous_pane_id: Option<String>,
@@ -1076,6 +1080,7 @@ impl ClientShellState {
             mode: ClientShellMode::Terminal,
             navigate_workspace_id: None,
             pending_workspace_highlight: None,
+            recent: Default::default(),
             reveal_navigation_workspace: false,
             overlay,
             previous_pane_id: None,
@@ -1585,6 +1590,12 @@ impl ClientShellState {
                 Some(_) => {}
             }
         }
+        if let Some(workspace_id) = snapshot.focused_workspace_id.clone() {
+            self.recent.visit(recent::RecentWorkspace {
+                endpoint_id: self.active_endpoint_id.clone(),
+                workspace_id,
+            });
+        }
         self.snapshot = Some(snapshot);
         self.reconcile_pending_workspace_highlight();
         let pending_surface = self.pending_pane_surface.take();
@@ -1883,6 +1894,7 @@ impl ClientShellState {
         self.selection_autoscroll_deadline
             .into_iter()
             .chain(self.selection_repaint_deadline)
+            .chain(self.recent_switcher_deadline())
             .min()
             .map(|deadline| deadline.saturating_duration_since(now).min(default))
             .unwrap_or(default)

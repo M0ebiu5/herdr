@@ -95,7 +95,7 @@ impl ClientShellState {
         matches!(
             self.mode,
             ClientShellMode::Prefix | ClientShellMode::Navigate
-        )
+        ) || self.recent_switcher_open()
     }
 
     pub(crate) fn set_host_reports_key_releases(&mut self, reports: bool) {
@@ -327,6 +327,8 @@ impl ClientShellState {
                 RawInputEvent::OuterFocusLost => {
                     outcome.repaint |= self.clear_link_hover();
                     self.outer_focused = Some(false);
+                    // The modifier may be let go in another window, unheard.
+                    outcome.repaint |= self.cancel_recent_switcher();
                     self.release_input_leases(&mut outcome);
                     outcome
                         .requests
@@ -383,6 +385,9 @@ impl ClientShellState {
         outcome.repaint |= self.clear_link_hover();
         if self.copy_operation_in_flight {
             self.copy_input_queue.push_back(key);
+            return;
+        }
+        if key.kind == KeyEventKind::Release && self.recent_switcher_key_released(&key, outcome) {
             return;
         }
         let key = if self.host_reports_key_releases && key.generated_text.is_some() {

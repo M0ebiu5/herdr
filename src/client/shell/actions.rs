@@ -43,6 +43,10 @@ impl ClientShellState {
                     self.begin_worktree_action(action, outcome);
                     return;
                 }
+                if action == crate::input::KeybindAction::RecentWorkspace {
+                    self.open_recent_switcher(outcome);
+                    return;
+                }
                 if action == crate::input::KeybindAction::OpenNavigator {
                     self.open_navigator_overlay();
                     outcome.repaint = true;

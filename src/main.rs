@@ -159,6 +159,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # close_workspace = "prefix+shift+d"
 # previous_workspace = "" # optional, unset by default
 # next_workspace = ""     # optional, unset by default
+# recent_workspace = ""   # optional, e.g. "ctrl+tab": most recently used workspace on any machine; press again quickly to go further back
 # previous_agent = ""     # optional, unset by default
 # next_agent = ""         # optional, unset by default
 # focus_agent = ""        # optional indexed binding, e.g. "prefix+alt+1..9"

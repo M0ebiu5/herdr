@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "recent_switcher.rs"]
+mod recent_switcher;
 #[path = "workspace_navigation.rs"]
 mod workspace_navigation;
 use crate::client::endpoint::{

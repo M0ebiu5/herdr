@@ -45,6 +45,7 @@ pub(crate) fn render_client_overlay(
     if !matches!(
         o,
         ClientShellOverlay::Navigator(_)
+            | ClientShellOverlay::RecentSwitcher(_)
             | ClientShellOverlay::ContextMenu(_)
             | ClientShellOverlay::GlobalMenu(_)
     ) {
@@ -67,6 +68,7 @@ pub(crate) fn render_client_overlay(
         ClientShellOverlay::Navigator(v) => {
             render_navigator_overlay(b, v, endpoints, active_endpoint_id, p)
         }
+        ClientShellOverlay::RecentSwitcher(v) => render_recent_switcher_overlay(b, v, endpoints, p),
         ClientShellOverlay::Settings(v) => {
             settings_overlay::render_settings_overlay(b, v, s.integration_updates_available, p)
         }
@@ -697,6 +699,141 @@ fn render_rename_overlay(
         worktree_search: Rect::default(),
         worktree_rows: Vec::new(),
         cursor,
+        ..OverlayRender::default()
+    })
+}
+
+fn render_recent_switcher_overlay(
+    b: &mut Buffer,
+    switcher: &recent::RecentSwitcher,
+    endpoints: &[ClientShellEndpoint],
+    p: &Palette,
+) -> Option<OverlayRender> {
+    struct Line {
+        label: String,
+        machine: String,
+        status: Option<crate::api::schema::AgentStatus>,
+    }
+    let lines: Vec<Line> = switcher
+        .list
+        .iter()
+        .map(|entry| {
+            let endpoint = endpoints
+                .iter()
+                .find(|endpoint| endpoint.endpoint_id == entry.endpoint_id);
+            let workspace = endpoint
+                .and_then(|endpoint| endpoint.snapshot.as_deref())
+                .and_then(|snapshot| {
+                    snapshot
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.workspace_id == entry.workspace_id)
+                });
+            Line {
+                label: workspace.map_or_else(
+                    || entry.workspace_id.clone(),
+                    |workspace| workspace.label.clone(),
+                ),
+                machine: endpoint
+                    .map(|endpoint| endpoint.label.clone())
+                    .unwrap_or_default(),
+                status: workspace.map(|workspace| workspace.agent_status),
+            }
+        })
+        .collect();
+    let federated = endpoints.len() > 1;
+    let widest = lines
+        .iter()
+        .map(|line| {
+            display_width(&line.label)
+                + if federated {
+                    display_width(&line.machine) + 3
+                } else {
+                    0
+                }
+        })
+        .max()
+        .unwrap_or(0);
+    let visible = lines
+        .len()
+        .min(usize::from(b.area.height.saturating_sub(7)).max(1));
+    let q = popup(
+        b.area,
+        widest.saturating_add(10).clamp(44, 80),
+        visible as u16 + 3,
+    )?;
+    let i = panel(b, q, p.accent, p.panel_bg)?;
+    put_text(
+        b,
+        q.x + 2,
+        q.y,
+        q.width.saturating_sub(4),
+        " Recent workspaces ",
+        Style::default().fg(p.accent).bg(p.panel_bg),
+    );
+    let first = if switcher.selected < visible {
+        0
+    } else {
+        switcher.selected + 1 - visible
+    };
+    for (offset, line) in lines.iter().skip(first).take(visible).enumerate() {
+        let index = first + offset;
+        let rect = Rect::new(i.x, i.y + offset as u16, i.width, 1);
+        let selected = index == switcher.selected;
+        let style = if selected {
+            Style::default()
+                .fg(contrast(p))
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text).bg(p.panel_bg)
+        };
+        b.set_style(rect, style);
+        let current = if index == 0 { "◆ " } else { "  " };
+        let dot = line.status.map(status_dot).unwrap_or_default();
+        let separator = if dot.is_empty() { "" } else { " " };
+        put_text(
+            b,
+            rect.x,
+            rect.y,
+            rect.width,
+            &format!(" {current}{dot}{separator}{}", line.label),
+            style,
+        );
+        if let Some(status) = line.status.filter(|_| !selected) {
+            put_text(
+                b,
+                rect.x + 3,
+                rect.y,
+                display_width(dot),
+                dot,
+                Style::default().fg(status_color(status, p)).bg(p.panel_bg),
+            );
+        }
+        if federated {
+            put_right_text(
+                b,
+                Rect::new(rect.x, rect.y, rect.width.saturating_sub(1), 1),
+                rect.y,
+                &line.machine,
+                if selected {
+                    style
+                } else {
+                    Style::default().fg(p.overlay0).bg(p.panel_bg)
+                },
+            );
+        }
+    }
+    put_text(
+        b,
+        i.x,
+        i.bottom() - 1,
+        i.width,
+        " again: older · ↵ switch · esc cancel",
+        Style::default().fg(p.overlay0).bg(p.panel_bg),
+    );
+    Some(OverlayRender {
+        area: q,
         ..OverlayRender::default()
     })
 }
